@@ -4,213 +4,261 @@ import json
 import re
 import ast
 import requests
+import time
 from pathlib import Path
-from retrieval import simple_keyword_retrieval
 from dotenv import load_dotenv
+from retrieval import simple_keyword_retrieval
 
-# ============================
-# 🔧 Load environment variables
-# ============================
-ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(dotenv_path=ROOT / ".env")
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# basic setup
+root_dir = Path(__file__).resolve().parents[1]
+load_dotenv(root_dir / ".env")
+api_token = os.getenv("GROQ_API_KEY")
 
-st.set_page_config(page_title="Road Safety Intervention GPT", layout="wide")
+st.set_page_config(page_title="Road Safety Intervention Tool", layout="wide")
+st.title("Road Safety Intervention Tool")
+st.write("Model-assisted selection of safety interventions based on a reference dataset.")
 
-st.title("🚦 Road Safety Intervention GPT — Groq OSS 120B")
-st.caption("Powered by Groq's OpenAI-Compatible API — Built for National Road Safety Hackathon")
-
-# Sidebar
-st.sidebar.header("Settings")
-if GROQ_API_KEY:
-    st.sidebar.success("✅ GROQ_API_KEY loaded")
+# sidebar inputs
+st.sidebar.header("Options")
+if api_token:
+    st.sidebar.success("API token loaded")
 else:
-    st.sidebar.error("❌ GROQ_API_KEY missing. Add it to your `.env` file.")
+    st.sidebar.error("API token not found")
 
-top_k = st.sidebar.slider("Top DB matches to include", 1, 6, 3)
-temp = st.sidebar.slider("Model temperature", 0.0, 1.0, 0.2, step=0.1)
-max_tokens = st.sidebar.number_input("Max tokens for model output", value=700, step=50)
+fetch_limit = st.sidebar.slider("Dataset items to match", 1, 10, 3)
+model_temp = st.sidebar.slider("Temperature", 0.0, 1.0, 0.1)
+token_cap = st.sidebar.number_input("Token limit", value=600, step=50)
 
-DATA_PATH = ROOT / "data" / "interventions.jsonl"
+data_file = root_dir / "data" / "interventions.jsonl"
 
-st.markdown("""
-### 🧠 About
-This tool retrieves top-matching interventions from the database and uses Groq’s **GPT-OSS 120B model**
-to recommend the most suitable **road safety interventions** with explanations and clause references.
-""")
 
-# ============================
-# 🧩 Input area
-# ============================
-st.subheader("Describe the road safety problem")
-user_input = st.text_area(
-    "Enter a detailed description:",
-    height=160,
-    value="Busy urban intersection near a school. No zebra crossing. Cars frequently run red lights. Poor night lighting."
-)
+# ------------------------------
+# JSON patching helper
+# ------------------------------
+def try_fix_json(output_txt):
+    if not output_txt or not isinstance(output_txt, str):
+        return None
 
-# ============================
-# 🚀 Action button
-# ============================
-if st.button("Retrieve & Recommend"):
-    if not user_input.strip():
-        st.warning("⚠️ Please enter a problem description.")
-    else:
-        with st.spinner("🔍 Retrieving top DB matches..."):
-            top = simple_keyword_retrieval(user_input, str(DATA_PATH), topk=top_k)
+    txt = output_txt.strip().replace("```json", "").replace("```", "").strip()
+    blocks = re.findall(r"\{[\s\S]*", txt)
+    if not blocks:
+        return None
 
-        st.subheader("📋 Top Database Matches Used")
-        for r in top:
-            st.markdown(f"""
-            **ID {r['id']} — {r['category']}**  
-            Clause: `{r.get('clause','-')}`  
-            Data: {r.get('data','')[:400]}...
-            """)
+    chunk = blocks[0].strip()
 
-        # ============================
-        # 🧠 Build structured prompt
-        # ============================
-        db_snippets = []
-        for r in top:
-            db_snippets.append(
-                f"ID {r['id']} | Category: {r.get('category')} | Clause: {r.get('clause')} | Data: {r.get('data')}"
-            )
-        db_text = "\n".join(db_snippets)
+    # normal attempt
+    try:
+        return json.loads(chunk)
+    except:
+        pass
 
-        prompt = f"""
-You are a precise and concise road safety expert.
-You must output ONLY valid JSON (no markdown, no commentary).
+    # the rest is best-effort fixing
+    if chunk.count('"') % 2 != 0:
+        chunk += '"'
 
-### Context
-The following database entries describe road safety interventions.
-Use ONLY these to recommend solutions for the given problem.
+    missing = chunk.count("{") - chunk.count("}")
+    if missing > 0:
+        chunk += "}" * missing
 
-### User Problem
-{user_input}
+    missing_br = chunk.count("[") - chunk.count("]")
+    if missing_br > 0:
+        chunk += "]" * missing_br
 
-### Database Entries
-{db_text}
+    chunk = re.sub(r",\s*([}\]])", r"\1", chunk)
 
-### Task
-1. Select the top 2–3 interventions that best solve the user's problem.
-2. For each intervention include:
-   - "title"
-   - "description"
-   - "why"
-   - "support" (list of ID and clause references)
-3. Include:
-   - "rationale" (short paragraph)
-   - "assumptions" (list)
-   - "references" (list of clause references)
+    try:
+        return json.loads(chunk)
+    except:
+        pass
 
-### Output Format
-Return ONLY this valid JSON (no text outside):
+    try:
+        return ast.literal_eval(chunk)
+    except:
+        return None
 
+
+# ------------------------------
+# Model call wrapper
+# ------------------------------
+def call_model(msgs, max_tokens, temp):
+    headers = {
+        "Authorization": f"Bearer {api_token}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": "openai/gpt-oss-120b",
+        "messages": msgs,
+        "temperature": float(temp),
+        "max_tokens": int(max_tokens),
+        "top_p": 1.0
+    }
+
+    resp = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=20
+    )
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+
+# ------------------------------
+# Preparing dataset summaries
+# ------------------------------
+def compress_items(entries):
+    rows = []
+    for e in entries:
+        main_text = e.get("data", "")
+        small = main_text[:350] + "..." if len(main_text) > 350 else main_text
+        row = f"ID {e['id']} | Category: {e['category']} | Clause: {e['clause']} | Data: {small}"
+        rows.append(row)
+    return "\n".join(rows)
+
+
+# ------------------------------
+# Prompt builder
+# ------------------------------
+def shape_prompt(user_case, data_text):
+    return f"""
+You must select road safety interventions from a provided dataset. 
+Only use entries found inside the dataset. Avoid inventing interventions or clauses. 
+Choose up to three options that match the user case. Write everything completely.
+
+User case:
+{user_case}
+
+Dataset:
+{data_text}
+
+Return strictly this JSON structure:
 {{
   "recommended_interventions": [
     {{
-      "title": "string",
-      "description": "string",
-      "why": "string",
-      "support": ["ID #", "Clause #"]
+      "title": "",
+      "description": "",
+      "why": "",
+      "support": ["ID #", "Clause #"],
+      "user_friendly_explanation": ""
     }}
   ],
-  "rationale": "string",
-  "assumptions": ["string"],
-  "references": ["string"]
+  "rationale": "",
+  "assumptions": [],
+  "references": []
 }}
-IMPORTANT:
-- Return ONLY valid JSON. 
-- Do not include ```json or ``` or any explanations.
-- Do not write text outside the JSON object.
-- Do not include comments or markdown.
-
 """
 
-        st.subheader("🧾 Prompt Sent to Model")
-        st.code(prompt, language="text")
 
-        # ============================
-        # 🧠 Groq API Call
-        # ============================
-        if not GROQ_API_KEY:
-            st.warning("⚠️ GROQ_API_KEY not found. Please add it to `.env`.")
-        else:
-            try:
-                headers = {
-                    "Authorization": f"Bearer {GROQ_API_KEY}",
-                    "Content-Type": "application/json"
+# ------------------------------
+# Render function
+# ------------------------------
+def display_interventions(data_obj):
+    if not data_obj or "recommended_interventions" not in data_obj:
+        return None
+
+    items = data_obj["recommended_interventions"]
+    if not items:
+        return None
+
+    lines = []
+    lines.append("## Recommended Interventions\n")
+
+    for idx, it in enumerate(items, start=1):
+        lines.append(f"### {idx}. {it.get('title', '')}")
+        lines.append(f"- Description: {it.get('description', '')}")
+        lines.append(f"- Reason: {it.get('why', '')}")
+        lines.append(f"- Explanation: {it.get('user_friendly_explanation', '')}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+# ------------------------------
+# Guaranteed fallback builder
+# ------------------------------
+def build_backup(entries):
+    if not entries:
+        return {
+            "recommended_interventions": [
+                {
+                    "title": "Basic Safety Measures",
+                    "description": "General signage, markings, and hazard awareness steps suitable for common road conditions.",
+                    "why": "Basic improvements can still help even without a precise dataset match.",
+                    "support": [],
+                    "user_friendly_explanation": "Introduce standard safety markings and signs appropriate for the area."
                 }
-                api_url = "https://api.groq.com/openai/v1/chat/completions"
+            ],
+            "rationale": "Fallback used due to insufficient data.",
+            "assumptions": [],
+            "references": []
+        }
 
-                payload = {
-                    "model": "openai/gpt-oss-120b",
-                    "messages": [
-                        {"role": "system", "content": "You are a precise road safety expert that outputs strict JSON only."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    "temperature": float(temp),
-                    "max_tokens": int(max_tokens),
-                    "top_p": 1.0
-                }
+    e = entries[0]
+    return {
+        "recommended_interventions": [
+            {
+                "title": f"Intervention based on dataset entry {e['id']}",
+                "description": e.get("data", "")[:250],
+                "why": "Closest dataset-linked measure identified as fallback option.",
+                "support": [f"ID {e['id']}", f"Clause {e['clause']}"],
+                "user_friendly_explanation": "A safety approach derived from the closest known dataset entry."
+            }
+        ],
+        "rationale": "Generated because model output was incomplete.",
+        "assumptions": [],
+        "references": []
+    }
 
-                resp = requests.post(api_url, headers=headers, json=payload)
-                resp.raise_for_status()
-                resp_json = resp.json()
-                text = resp_json["choices"][0]["message"]["content"].strip()
 
-                # ============================
-                # 🧩 Clean & Parse JSON
-                # ============================
-                st.subheader("🧮 Model Output (Raw)")
-                cleaned = re.sub(r"```(json)?", "", text)
-                cleaned = cleaned.replace("```", "").strip()
-                st.code(cleaned, language="json")
+# ------------------------------
+# Interface
+# ------------------------------
+st.subheader("Describe the road safety issue")
+case_text = st.text_area("Enter description:", height=150)
 
-                def try_parse_json(txt):
-                    try:
-                        return json.loads(txt)
-                    except:
-                        pass
-                    try:
-                        return ast.literal_eval(txt)
-                    except:
-                        pass
-                    m = re.search(r"\{.*\}", txt, re.DOTALL)
-                    if m:
-                        try:
-                            return json.loads(m.group(0))
-                        except:
-                            try:
-                                return ast.literal_eval(m.group(0))
-                            except:
-                                return None
-                    return None
+if st.button("Generate"):
+    if not case_text.strip():
+        st.warning("Please write some details.")
+        st.stop()
 
-                out = try_parse_json(cleaned)
+    with st.spinner("Looking up dataset..."):
+        found_items = simple_keyword_retrieval(case_text, str(data_file), topk=fetch_limit)
 
-                # ============================
-                # ✅ Display parsed results
-                # ============================
-                if out:
-                    st.success("✅ Successfully parsed model output")
-                    st.subheader("📌 Recommended Interventions")
-                    for idx, it in enumerate(out.get("recommended_interventions", []), start=1):
-                        st.markdown(f"### {idx}. {it.get('title','No title')}")
-                        st.write(it.get("description", ""))
-                        st.write("**Why it helps:**", it.get("why", ""))
-                        st.write("**Support:**", ", ".join(it.get("support", [])))
+    st.subheader("Dataset Matches")
+    if not found_items:
+        st.write("No matching dataset entries were located.")
+    else:
+        for f in found_items:
+            st.markdown(f"**ID {f['id']} – {f['category']}** | Clause {f['clause']}")
+            st.write(f["data"][:200] + "...")
+            st.markdown("---")
 
-                    st.markdown("---")
-                    st.markdown(f"**Rationale:** {out.get('rationale','')}")
-                    st.markdown(f"**Assumptions:** {', '.join(out.get('assumptions', []))}")
-                    st.markdown(f"**References:** {', '.join(out.get('references', []))}")
-                else:
-                    st.error("⚠️ Could not parse model output as JSON. Please review the raw output above.")
+    dataset_text = compress_items(found_items)
+    prompt = shape_prompt(case_text, dataset_text)
 
-            except Exception as e:
-                st.error(f"API Error: {e}")
+    start = time.time()
+    raw_model_out = call_model(
+        [
+            {"role": "system", "content": "Return valid JSON only."},
+            {"role": "user", "content": prompt}
+        ],
+        token_cap,
+        model_temp
+    )
+    end = time.time()
 
-st.markdown("---")
-st.caption("Prototype built for National Road Safety Hackathon — uses Groq OSS 120B model for recommendations.")
+    st.subheader("Raw Output")
+    st.code(raw_model_out)
+
+    parsed = try_fix_json(raw_model_out)
+
+    st.subheader("Final Recommendations")
+
+    if parsed and parsed.get("recommended_interventions"):
+        final_txt = display_interventions(parsed)
+        st.markdown(final_txt)
+    else:
+        backup_obj = build_backup(found_items)
+        st.markdown(display_interventions(backup_obj))
+
+    st.info(f"Time taken: {end - start:.2f} seconds")
